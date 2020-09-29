@@ -1,0 +1,923 @@
+---
+title: "Mice dorsal striatum scRNA-seq analysis"
+date: "`r Sys.Date()`"
+author: "Giacomo Mutti"
+output:
+    rmdformats::readthedown:
+      number_sections: TRUE
+      code_folding: hide
+      self_contained: true
+      thumbnails: false
+      lightbox: false
+    highlight: kate
+bibliography: biblio.bib
+---
+```{css, echo = FALSE}
+#content{
+    background:#fcfcfc;
+    height:100%;
+    margin-left:300px;
+    /* margin:auto; */
+    max-width:1200px;
+    min-height:100%;
+}
+```    
+
+```{r setup, echo=FALSE, cache=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="300")
+opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE,
+               out.width = "100%",
+               dpi = 200)
+```
+
+
+# Introduction
+
+We'll perform single cell RNA-seq analysis on mice dorsal striatum tissue. These data include a subset of cells studied on *'Molecular Architecture of the Mouse Nervous System'* [@zeisel2018molecular]. The data have been taken from this [repository](https://panglaodb.se/view_data.php?sra=SRA667466&srs=SRS3059955) stored in [PanglaoDB](https://panglaodb.se/index.html), a web repository of scRNA-seq data [@franzen2019panglaodb]. These data were obtained with 10x Chromium protocol sequenced by Illumina HiSeq 2500.
+
+The main workflow is also heavily inspired by Roman Hillje github repo [scRNA-seq analysis workflow](https://romanhaa.github.io/projects/scrnaseq_workflow/) [@Romanhaa2020]. 
+
+## Dependencies
+
+First of all we load all necessary dependencies plus some useful plotting functions stored in another file. We'll mainly use the [Seurat](https://satijalab.org/seurat/) package [@stuart2019comprehensive], which focuses on single cell QC and explorative analysis. More or less we'll follow the standard [Seurat](https://satijalab.org/seurat/) pipeline (see [Seurat tutorial](https://satijalab.org/seurat/v3.2/pbmc3k_tutorial.html)) with some additions.
+
+```{r dependencies, results='hide', message=FALSE, warning=FALSE, cache=FALSE}
+library(SingleCellExperiment)
+library(Seurat)
+library(scDblFinder)
+library(Matrix)
+###
+library(cluster)
+library(tidyverse)
+library(here)
+library(patchwork)
+library(ggExtra)
+library(ggrepel)
+library(gghalves)
+library(patchwork)
+library(viridis)
+library(cowplot)
+
+
+# my own useful functions - see funs.r 
+source("R/funs.R")
+```
+
+## Data loading
+
+To load the already prepared count table, we downloaded the Rdata file containg the sparse matrix from PanglaoDB. Then, we load it as a standard R object. In this matrix rows are gene, columns are cells and counts are not normalized. To only keep gene symbol we'll substitute everything after "ENS". Furthermore, we also filter this matrix with the same filters shown in the Panglao repo (counted reads > 1000 and genes expression over all cells > 0)   
+
+```{r prep}
+load(here("data","SRA667466_SRS3059955.sparse.RData"))
+
+rownames(sm) <- gsub("_ENS.*","", rownames(sm))
+
+sm_red <- sm[,colSums(sm)>1000]
+sm_red <- sm_red[rowSums(sm_red)!=0,]
+```
+
+There are `r length(which(duplicated(rownames(sm))))` duplicates genes, but [Seurat](https://satijalab.org/seurat/) will take care of that. The full matrix has these dimensions: `r dim(sm)` (genes, cells). The panglao reduced one has `r dim(sm_red)` (as in the dataset description).
+
+After that, we use the raw counts to initialize a [Seurat](https://satijalab.org/seurat/) object. This type of object has useful slots and methods that will be useful in further analysis. Everytime a [Seurat](https://satijalab.org/seurat/) object is initialized a metadata slot is also created. It can be accessed through `Seurat[[]]` or `Seurat@meta.data`. This is basically a dataframe containing useful information about the cells in our dataset. We'll append two columns to this df which are percentage of mitochondrial reads for each cell (percent.mt) and novelty (computed as number of genes / number of reads). This measures range from 0 to 1 and is related to how deep we sequenced. Low values means that every new read will probably will be assigned to an already discovered gene whereas high values would mean that for each new reads a new gene will be discovered. This can be useful in detecting low complexity cells (few expressed genes that are easily saturated). We do the same fore the panglao reduced data. To ease our laptop life we also remove the raw matrix from the environment
+
+```{r init}
+sm_seurat <- CreateSeuratObject(counts = sm, project = "sc_proj")
+sm_seurat[["percent.mt"]] <- PercentageFeatureSet(sm_seurat, pattern = "^mt-")
+sm_seurat[['novelty']] <-  sm_seurat[[]]$nFeature_RNA / sm_seurat[[]]$nCount_RNA
+
+panglao <- CreateSeuratObject(counts = sm_red, project = "panglao")
+panglao[["percent.mt"]] <- PercentageFeatureSet(panglao, pattern = "^mt-")
+# there are only 17 annotated genes but there are 37 genes in the mt 
+panglao[['novelty']] <-  panglao[[]]$nFeature_RNA / panglao[[]]$nCount_RNA
+
+rm(sm, sm_red)
+```
+
+# Data pre-processing
+
+To preprocess single cell RNA-seq data on [Seurat](https://satijalab.org/seurat/) we'll follow the standard pipeline, but we'll also try to analyze the doublets influence on our dataset.
+The main steps will be:
+
+1. Doublet analysis
+2. QC analysis
+3. Counts normalization
+4. Detection of highly variable genes
+5. Gene scaling
+
+## Doublet analysis
+
+
+In order to remove doublets from our dataset we follow the same procedure as in [@Romanhaa2020] using the `ScDblFinder` package [@scdbl]. This package finds doublets in single cell data by creating artificial doublets and looking at their prevalence in the neighborhood of each cell.
+
+This function is inspired by [@Romanhaa2020].
+
+```{r doublet, fig.cap="Doublet analysis regarding the main QC covariates", fig.height=8, fig.width=15}
+dbl <- invisible(colData(scDblFinder(as.SingleCellExperiment(sm_seurat), verbose = FALSE)))
+sm_seurat$multiplet_class <-dbl$scDblFinder.class
+sm_seurat$doublet_score <- dbl$scDblFinder.score
+
+rm(dbl)
+
+doublet_analysis(sm_seurat@meta.data, col = c("#ffc313","#c4e538")) 
+```
+
+We can see that the proportion of inferred doublets in our dataset is `r paste0(round(as.numeric(table(sm_seurat@meta.data$multiplet_class)[1]/nrow(sm_seurat@meta.data)*100),2),"%")` of the cells. Also the different distribution of qc covariates is evident.
+
+We then remove the doublet cells.
+
+```{r removedbl}
+sm_seurat <- subset(sm_seurat, subset = multiplet_class == 'singlet')
+```
+
+## QC analysis
+
+QC analysis will be performed on 4 main covariates:
+
+1. Number of counts per cell
+2. Number of genes per cell
+3. Mitochondrial fraction of genes
+4. Novelty
+
+The filtering is made by playing with thresholds of these covariates. Cells with few genes and high mito percentage may be dead cells with cytoplasmic mRNA leaked out. Whereas cells with exceptionally high number of reads may be doublets. Low novelty may represent low complexity cells as blood red cells. Nevertheless, we must be careful with these threshold as we could exclude informative cells population such as cells involved in respiratory processes (high mito) or quiescient populations (low reads) [@luecken2019current].
+
+We can examine the distribution of these covariates with few different visualizations. 
+
+```{r prel, fig.cap = "Scatterplot of QC covariates of full dataset, red bars represent 10th percentile"}
+
+cont <- list(scale_color_viridis(discrete = FALSE),
+             guides(color = guide_colourbar( 
+               barwidth = 0.2, barheight = 10, 
+               title.position = "left", 
+               title.theme = element_text(angle = 90, hjust = 0.5))))
+
+scatter_full1 <- scatter_plot(sm_seurat@meta.data, 'nCount_RNA', 'nFeature_RNA', 'percent.mt') + 
+  cont
+scatter_full2 <- scatter_plot(sm_seurat@meta.data, 'nCount_RNA','percent.mt', 'nFeature_RNA') + 
+  cont
+
+scatter_full1 | scatter_full2 
+```
+
+We can observe that, as expected, the number of genes and the number of transcritpts are positevely correlated. However, there seems to be two main trajectories. This could be due to Neurons (our majority class presumably) vs all other cells. Also, we can see a small population of cells with low novelty values (lots of reads and few genes), this may be due to low complexity cells.
+
+```{r prel2, fig.cap = "Scatterplot of QC covariates of panglao data, red bars represent 10th percentile"}
+scatter_panglao1 <- scatter_plot(panglao@meta.data, 'nCount_RNA','nFeature_RNA', 'percent.mt') + 
+  cont
+
+scatter_panglao2 <- scatter_plot(panglao@meta.data, 'nCount_RNA','percent.mt', 'nFeature_RNA') + 
+  cont
+scatter_panglao1 | scatter_panglao2
+```
+The Panglao data show more or less the same trend, however many cells (nCount<1000) were filtered out.
+
+We can also visualize QC covariates distribution with violin plots
+
+```{r vln, fig.cap="Violinplot of number of reads and genes distribution in whole df (A) and panglao df (B)", fig.height=2.5}
+t <- list(theme(axis.title.y = element_blank(),
+                axis.text.y = element_blank(),
+                axis.ticks.y = element_blank()),
+          scale_color_manual(values = "#FDA7DF"),
+          scale_fill_manual(values = "#B53471"))
+ 
+p1 <- vln_plot(sm_seurat@meta.data, 'orig.ident', 'nCount_RNA', log = T, jitter = T) +
+  t
+
+p2 <- vln_plot(sm_seurat@meta.data, 'orig.ident', 'nFeature_RNA', log = T, jitter = T) +
+  t
+
+patch1 <- p1 | p2
+patch1 + plot_annotation(tag_levels = 'A')
+```
+
+We can also visualize their distribution with a parallel coordinates plot. This kind of plot is useful to visualize how may covariates change with respect to one another. Given that ther's no grouping in the data, colors are given based on the quartiles of the first covariates in order to bettere visualize their relationships. Furthermore, this function is not performed on all the cells given that it's reallly slow. Maybe using base r graphics or other optimized plotting libraries might help. Features are scaled from 0 to 100 in order to have the same range.
+
+```{r parc, fig.cap="Parallell coordinates plot of whole df (A) and Panglao df (B) covariates, only 1000 cells taken because this function is quite slow", fig.height=5, fig.width=8}
+p3 <- par_coor(head(sm_seurat@meta.data,1000))
+
+p4 <- par_coor(head(panglao@meta.data,1000))
+
+patch2 <- p3 | p4 
+patch2 + plot_annotation(tag_levels = "A")
+```
+
+We can more or less draw the same conclusions as before. 
+
+In order to decide the filters we wrote a high level function that analyse the dataset tryin to capture all its possible interesting features. (Heavily inspired by [@luecken2019current])
+
+```{r prelim3, fig.cap="Preliminary analysis of whole dataset, red bars represent 10th quantile", fig.width=15, fig.height=10}
+
+prelim_analysis(sm_seurat)
+
+```
+
+## Final datasets 
+
+After visualizing this variables we decided to continue the analysis on three different datasets.
+
+1. Loosely filtered
+2. Strictly filtered
+3. Panglao criteria
+
+
+```{r filter}
+loose <- subset(sm_seurat, subset =  nFeature_RNA < 4000 & nFeature_RNA > 50
+                    & nCount_RNA > 70 & nCount_RNA < 10000
+                    & percent.mt < 18
+                    & novelty > 0.3)
+
+strict <- subset(sm_seurat, subset =  nFeature_RNA < 3000 & nFeature_RNA > 100
+                 & nCount_RNA > 1000 & nCount_RNA < 8000
+                 & percent.mt < 12
+                 & novelty > 0.4)
+
+rm(sm_seurat)
+```
+
+So we obtain three datasets with these abundance of cells:
+
+1. Loose: `r dim(loose)[2]` cells
+2. Strict: `r dim(strict)[2]` cells
+3. Panglao: `r dim(panglao)[2]` cells
+
+
+## View  {.tabset .tabset-fade .tabset-pills}
+
+### Loose { .unnumbered}
+
+```{r preliml, fig.cap="Preliminary analysis of whole dataset, red bars represent 10th quantile", fig.width=15, fig.height=10}
+
+prelim_analysis(loose, depth_threshold = c(70,10000),
+                            genes_threshold = c(50,4000),
+                            mit_threshold = 18,
+                            novelty_threshold = 0.3)
+
+```
+
+Loose filters are: 
+
+* number of genes between 50 and 4000
+* number of reads between 70 and 10000
+* mito percentage < 18%
+* novelty > 0.3
+
+
+### Strict { .unnumbered}
+
+```{r prelims, fig.cap="Preliminary analysis of whole dataset, red bars represent 10th quantile", fig.width=15, fig.height=10}
+
+prelim_analysis(strict, depth_threshold = c(1000, 8000),
+                            genes_threshold = c(100,3000),
+                            mit_threshold = 12,
+                            novelty_threshold = 0.4)
+
+```
+Strict filters are:
+
+* number of genes between 100 and 3000
+* number of reads between 1000 and 8000
+* mito percentage < 12%
+* novelty > 0.3
+
+### Panglao { .unnumbered}
+
+```{r prelimp, fig.cap="Preliminary analysis of whole dataset, red bars represent 10th quantile", fig.width=15, fig.height=10}
+
+prelim_analysis(panglao, depth_threshold = 1000)
+
+```
+
+Here we used Panglao criteria:
+
+* number of reads > 1000
+
+## Counts normalization
+
+To normalize counts we'll follow the standard [Seurat](https://satijalab.org/seurat/) procedure using `NormalizeData()` function. By default this function normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor (10,000 by default). This normalization method is basically 'counts per million' normalization as done in bulk exoression analyisi. After this the counts are log-transformed (log(x+1)). This is useful because it's the canonical way in which cheanges in epression are measured, reduce the skewness of the data and mitigate the mean variance relationship [@luecken2019current]. 
+
+```{r norm}
+
+loose <- NormalizeData(loose)
+strict <- NormalizeData(strict)
+panglao <- NormalizeData(panglao)
+
+```
+
+Normalized data are in `seurat[['RNA']]@data` whereas raw counts are in `sm_seurat[['RNA']]@counts`
+
+## Detection of highly variable genes
+
+We then perform feature selection, this means trying to decide which are the most informative genes. We'll use the [Seurat](https://satijalab.org/seurat/) function `FindVariableFeatures()` with default options, only increasing the final number of genes from 2000 to 3000. This function models the mean and variance relationship of each gene.
+
+```{r fs, fig.cap="Variable features of each of the three datasets", fig.width=10}
+loose <- FindVariableFeatures(loose, selection.method = "vst", nfeatures = 3000)
+strict <- FindVariableFeatures(strict, selection.method = "vst", nfeatures = 3000)
+panglao <- FindVariableFeatures(panglao, selection.method = "vst", nfeatures = 3000)
+```
+
+## Results {.tabset .tabset-fade .tabset-pills}
+
+### Loose { .unnumbered}
+
+```{r vfetl, fig.cap="Variable features of Loose datasets"}
+varfeat(loose) + labs(subtitle = "Loose Variable Features") 
+```
+
+### Strict { .unnumbered}
+
+```{r vfets, fig.cap="Variable features of Strict datasets"}
+varfeat(strict) + labs(subtitle = "Strict Variable Features") 
+```
+
+### Panglao { .unnumbered}
+
+```{r vfetp, fig.cap="Variable features of Panglao datasets"}
+varfeat(panglao) + labs(subtitle = "Panglao Variable Features") 
+```
+
+## Gene scaling
+
+Finally, we scale the counts so each gene has mean across cells is 0 and variance across cells is 1. This is a debated step as dimensionality reduction methods like PCA often requires it so to not being excessively driven by genes with higher ranges of expression. However, by doing this we assume that the magnitude of difference in expression is not informative [@luecken2019current].
+
+We'll do that only on the genes we previously found. Otherwise our laptop will have a hard time and after all our further analysis won't be affected. 
+
+The results are in `Seurat[['RNA']]@scale.data`.
+
+```{r scale}
+loose <- ScaleData(loose)
+strict <- ScaleData(strict)
+panglao <- ScaleData(panglao)
+```
+
+# Principal Component Analysis
+
+Principal Component Analysis (PCA) is often used to reduce dimensionality of the dataset. Reducing the dimensions of the original matrix is essential as single cell data are inherently low-dimensionals [@heimberg2016low]. PCA is a linear algorithm to do this, therefore, it's not suited for visualizing these kind of data in low dimensions. However, it is often used to summarize data to perform further analysis, as in this case. In fact, the next steps will be computed on N reduced dataset, where N is the number of top principal components kept. This parameter is commonly estimated through elbow technique.
+
+Furthermore, PCA is also used for visualization, given that it can project multidimensional features spaces in 2 or 3 PCs. Even if it does not perfrom well on this kind of data it' might be 's a good idea to visualize the first dimensions.
+
+```{r pca}
+
+loose <- RunPCA(loose, features = VariableFeatures(object = loose))
+strict <- RunPCA(strict, features = VariableFeatures(object = strict))
+panglao <- RunPCA(panglao, features = VariableFeatures(object = panglao))
+
+```
+
+## Results {.tabset .tabset-fade .tabset-pills}
+
+### Loose { .unnumbered}
+
+```{r pcal, fig.cap=c("Elbow plot of PCA components of Loose datasets","First two PCS of Loose dataset, colored by the number of genes")}
+
+PC_elbow(loose, threshold = 15, xmax = 40) + ggtitle("Loose") 
+dimplot_custom(loose, 'nFeature_RNA', 'pca') + cont + ggtitle("Loose") 
+
+```
+
+### Strict { .unnumbered}
+
+```{r pcas, fig.cap=c("Elbow plot of PCA components of Strict datasets","First two PCS of Strict dataset, colored by the number of genes")}
+
+PC_elbow(strict, threshold = 15, xmax = 40) + ggtitle("Strict") 
+dimplot_custom(strict, 'nFeature_RNA', 'pca') + cont + ggtitle("Strict")
+
+```
+
+### Panglao { .unnumbered}
+
+```{r pcaplot, fig.cap=c("Elbow plot of PCA components of Panglao datasets","First two PCS of Panglao dataset, colored by the number of genes")}
+
+PC_elbow(panglao, threshold = 15, xmax = 40) + ggtitle("Panglao") 
+dimplot_custom(panglao, 'nFeature_RNA', 'pca') + cont + ggtitle("Panglao")
+
+```
+
+
+From now on we'll use the first 15 PCs, this was decided through some trials. Anyway, there seems to be agreement that is better to overestimate rather than using too few PCs.
+
+# Clustering
+
+To cluster our cells we'll follow the [Seurat](https://satijalab.org/seurat/) functions `FindNeighbors()` and `FindClusters()`. Briefly, `FindNeighbors()` computes clustering starting from a KNN graph (with euclidean distances) in the reduced PCA spaces (15 dimensions). Then, each edge of the graph is weighted based on the overlap of local neighbors (using Jaccard similarity)
+
+Finally, the `FindClusters()` function by default implements the Louvain algorithm to iteratively group cells together. This function has a `resolution` parameter which sets the granularity of the clustering. Lower resolution lower granularity. It's suggested to set this parameter to 0.4-1.2 for datasets around 3000 cells.
+
+In our case we'll use 4 different values based on the dimensions of our datasets, then we'll explore which resolution produced a bettere clustering.
+
+```{r clust, error=FALSE}
+invisible({capture.output({
+
+npcs = 15
+### HERE CHOOSE NUMBER OF DIMENSIONS
+
+loose <- FindNeighbors(loose, dims = 1:npcs)
+loose <- FindClusters(loose, resolution = c(0.8, 1, 2, 4))
+
+strict <- FindNeighbors(strict, dims = 1:npcs)
+strict <- FindClusters(strict, resolution = c(0.4, 0.8, 1, 1.2))
+
+panglao <- FindNeighbors(panglao, dims = 1:npcs)
+panglao <- FindClusters(panglao, resolution = c(0.8, 1, 1.2,2))
+
+
+})})
+```
+
+## Results {.tabset .tabset-fade .tabset-pills}
+
+To understand which resolution worked best for our purposes we can visualize the number of clusters for each value or the distribution of reads/genes. Furthermore, we can compute the silhouette for each different resolution value. This is done following the instructions at this [GitHub](https://github.com/satijalab/Integration2019/blob/master/analysis_code/integration/integration_metrics.R#L36) page.
+
+### Loose { .unnumbered}
+
+```{r clustloose, fig.cap=c("Abundance of clusters in loosely filtered data based on resolution value","Number of reads distribution for each cluster divided by resolution value on loosely filtered data","Silhouette analysis for each resolution on loosely filtered data"), fig.height=4, fig.width=10}
+
+cluster_abundance(loose, res = T) + scale_fill_viridis(discrete = TRUE) + theme(axis.text.x = element_blank())
+
+cluster_density(loose, 'nCount_RNA', res = TRUE) +
+  scale_fill_viridis(discrete = TRUE) +
+  scale_color_viridis(discrete = TRUE)
+
+silhouette_analysis(loose, npcs = npcs)
+```
+
+We can see that by increasing the resolution the number of clusters increases. The distribution of number of genes in clusters varies quite a bit with some clusters with low counts and some with high variability. The silhouette analysis suggests that despite the high number of cells a lower value of resolution seems to work best. For this reason we'll go on with the clusters defined with res = 0.8.
+
+```{r renamel}
+Idents(loose) <- 'RNA_snn_res.0.8'
+loose@meta.data$seurat_clusters <- loose@meta.data$RNA_snn_res.0.8
+```
+
+### Strict { .unnumbered}
+
+We then perform the same analysis on our strictly filtered dataset in order to decide which resolution is the best.
+
+```{r cluststrict, fig.cap=c("Abundance of clusters in strictly filtered data based on resolution value","Number of reads distribution for each cluster divided by resolution value on strictly filtered data","Silhouette analysis for each resolution on strictly filtered data"), fig.height=4, fig.width=10}
+
+cluster_abundance(strict, res = T) + scale_fill_viridis(discrete = TRUE) + theme(axis.text.x = element_blank())
+
+
+cluster_density(strict, 'nCount_RNA', res = TRUE) +
+  scale_fill_viridis(discrete = TRUE) +
+  scale_color_viridis(discrete = TRUE)
+
+silhouette_analysis(strict, npcs = npcs)
+
+```
+
+Here we decided to use res = 0.8 in order to try to not oversimplify the groups (with res = 0.4) even if, probably, with these filters we may have lost some cells sub-population. Neverthless the mean silhouette value is similar.
+
+```{r rename}
+Idents(strict) <- 'RNA_snn_res.0.8'
+strict@meta.data$seurat_clusters <- strict@meta.data$RNA_snn_res.0.8
+```
+
+### Panglao { .unnumbered}
+
+Finally, we do the same on panglao data.
+
+```{r clustpanglao, fig.cap=c("Abundance of clusters in panglao data based on resolution value","Number of reads distribution for each cluster divided by resolution value on panglao data","Silhouette analysis for each resolution on panglao data"), fig.height=4, fig.width=10}
+
+cluster_abundance(panglao, res = T) + scale_fill_viridis(discrete = TRUE) + theme(axis.text.x = element_blank())
+
+cluster_density(panglao, 'nCount_RNA', res = TRUE) +
+  scale_fill_viridis(discrete = TRUE) +
+  scale_color_viridis(discrete = TRUE)
+
+silhouette_analysis(panglao, npcs = npcs)
+
+```
+For these data we decided to proceed with res = 1.
+
+```{r renamep}
+Idents(panglao) <- 'RNA_snn_res.1'
+panglao@meta.data$seurat_clusters <- panglao@meta.data$RNA_snn_res.1
+```
+
+# Cell cycle scoring
+
+To assess how the cell cycle was influencing our dataset we decided to infer the stage for each cell using the `CellCycleScoring()` function. This function assign a score for each cell representing the probability of being in phase S, G2M or G1. It manages to do that thanks to a list of phase specific marker genes stored in `cc.genes`. We'll only explore how this variable is distributed in our data but we won't regress out cell cycle information.
+
+
+```{r cellcycle}
+cc.genes <- lapply(cc.genes, str_to_title)
+ 
+loose <- CellCycleScoring( loose, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+strict <- CellCycleScoring( strict, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+panglao <- CellCycleScoring( panglao, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes)
+
+loose@meta.data <- loose@meta.data %>% mutate(Phase = factor(Phase))
+strict@meta.data <- strict@meta.data %>% mutate(Phase = factor(Phase))
+panglao@meta.data <- panglao@meta.data %>% mutate(Phase = factor(Phase))
+
+```
+
+## Results {.tabset .tabset-fade .tabset-pills}
+
+### Loose {.unnumbered}
+
+```{r phasel, fig.cap="A. Distribution of phase specific cells in Loose dataset. B. Distribution in each cluster"}
+
+l1 <- phase_prop(loose) + labs(subtitle = 'Loose')
+
+l2 <- phase_prop(loose, by.cluster = T) + labs(subtitle = 'Loose')
+
+l1 + l2 + plot_layout(widths = c(1,3)) + plot_annotation(tag_levels = 'A')
+  
+```
+
+### Strict {.unnumbered}
+
+```{r phases, fig.cap="A. Distribution of phase specific cells in Strict dataset. B. Distribution in each cluster"}
+#
+s1 <- phase_prop(strict) + labs(subtitle = 'Strict')
+
+s2 <- phase_prop(strict, by.cluster = T) + labs(subtitle = 'Strict') 
+
+s1 + s2 + plot_layout(widths = c(1,3))  + plot_annotation(tag_levels = 'A')
+
+```
+
+### Panglao {.unnumbered}
+
+```{r phasep, fig.cap="A. Distribution of phase specific cells in Panglao dataset. B. Distribution in each cluster"}
+
+pp1 <- phase_prop(panglao) + labs(subtitle = 'Panglao')
+
+pp2 <- phase_prop(panglao, by.cluster = T) + labs(subtitle = 'Panglao')
+
+pp1 + pp2 + plot_layout(widths = c(1,3)) + plot_annotation(tag_levels = 'A')
+```
+
+We can see that more or less the proportion of cell phases are the same between datsets and between clusters. Except for few peculiar clusters with almost no cells in G1 phase (12 in loose, 9-11 in strict and 9-12 in panglao). We'll try to figure out the reason behind this, they may represent specific proliferating cells.
+
+# Non-linear dimensionality reduction
+
+Non linear dimensionality algortihms are often used to visualize complex data in 2 dimensions. The most common techiniques emplyed in scRNA-seq analysis are t-distributed stochastic neighbour embedding (tSNE) [@maaten2008visualizing] and Uniform Approximation and Projection method (UMAP) [@2018arXivUMAP]. The first tends to capture local affinity rather than global structure. This characteristic is controllled by the perplexity parameter, at lower perplexity the projected data will be spread out with little preservation of global structure. UMAP is a new algorithm able to scale up well with increasing data dimensions and to preserve global structure. UMAP main parameter is the number of neighbors used to construct the initial graph. Low values will cause to focus on local structures while higher values will result in a representation of the big picture.  
+
+We'll run both of these algorithms on our datasets with default Seurat parameters.
+
+```{r umaptsne}
+
+loose <- RunUMAP(loose, dims = 1:npcs)
+loose <- RunTSNE(loose, dims = 1:npcs)
+
+strict <- RunUMAP(strict, dims = 1:npcs)
+strict <- RunTSNE(strict, dims = 1:npcs)
+
+panglao <- RunUMAP(panglao, dims = 1:npcs)
+panglao <- RunTSNE(panglao, dims = 1:npcs)
+```
+
+For each dataset we'll perform a visual analysis in the newly reduced space:
+
+* Continous vars contains the scatterplot in the reduced dimensions where cells are colored by number of reads, mito percentage and novelty.
+* Phase plot represent the cells in redcude dimensions colore by cellphase
+* Phase facet is the same plot as before but faceted by phase in order to visualize overlapping points
+* Clusters represents cells colored by cluster in the reduced dimensions
+
+## Results {.tabset .tabset-fade .tabset-pills}
+
+### Loose {.tabset .tabset-fade .tabset-pills .unnumbered}
+
+```{r dimredl2}
+
+loose_dimred <- dimred_analysis(loose)
+```
+
+#### Continuous vars {.unnumbered}
+
+```{r contl, fig.height=8, fig.width=10}
+loose_dimred$cont
+```
+
+#### Phase {.unnumbered}
+
+```{r phasel2}
+loose_dimred$phase
+```
+
+#### Phase faceted {.unnumbered}
+
+```{r phaselfacet}
+
+loose_dimred$phase_facet
+```
+
+#### Clusters {.unnumbered}
+
+```{r clustl}
+loose_dimred$clust
+```
+
+### Strict {.tabset .tabset-fade .tabset-pills .unnumbered}
+
+```{r dimredl}
+
+strict_dimred <- dimred_analysis(strict)
+```
+
+#### Continuous vars {.unnumbered}
+
+```{r conts, fig.height=8, fig.width=10}
+strict_dimred$cont
+```
+
+#### Phase {.unnumbered}
+
+```{r phases2}
+strict_dimred$phase
+```
+
+#### Phase faceted {.unnumbered}
+
+```{r phasesfacet}
+strict_dimred$phase_facet
+```
+
+#### Clusters {.unnumbered}
+
+```{r clusts}
+strict_dimred$clust
+```
+
+
+### Panglao {.tabset .tabset-fade .tabset-pills .unnumbered}
+
+```{r dimredp2}
+
+panglao_dimred <- dimred_analysis(panglao)
+```
+
+#### Continuous vars {.unnumbered}
+
+```{r contp2, fig.height=8, fig.width=10}
+panglao_dimred$cont
+```
+
+#### Phase {.unnumbered}
+
+```{r phasep2}
+panglao_dimred$phase
+```
+
+#### Phase faceted {.unnumbered}
+
+```{r phasepfacet}
+panglao_dimred$phase_facet
+```
+
+#### Clusters {.unnumbered}
+
+```{r clustp2}
+panglao_dimred$clust
+```
+
+# Cell type markers
+
+We can find differently expressed genes of single clusters compared to all other cells. This can be done through the `FindAllMArkers()` function. This function returns a dataframe of genes for each cluster with associated statistics like p-value and average log fold change. The default is to do a wilcoxon test against all other groups.
+
+```{r markers}
+loose.markers <- FindAllMarkers(loose, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+strict.markers <- FindAllMarkers(strict, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+panglao.markers <- FindAllMarkers(panglao, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+```
+
+## Genes  {.tabset .tabset-fade .tabset-pills}
+
+We can visualize the expression of this gene in our cells by coloring each cell by the intensity of its expression or by doing a violinplot of the gene expression in each cluster.
+
+
+### Loose {.unnumbered}
+
+```{r featureplotl, fig.cap=c("Feature plot of the first DE gene (by avg logFC) for each cluster", "Violin plot of the same genes"), fig.height=15, fig.width=15}
+FeaturePlot(loose, features = top_spread(loose.markers, 1)$rank1, 
+            reduction = 'umap', cols = c('#e7e1ef',"#b71540"), 
+            coord.fixed = TRUE)
+
+VlnPlot(loose, features = top_spread(loose.markers, 1)$rank1, slot = "counts", log = TRUE, pt.size = 0)
+
+```
+
+### Strict {.unnumbered}
+
+```{r featureplots, fig.cap=c("Feature plot of the first DE gene (by avg logFC) for each cluster", "Violin plot of the same genes"), fig.height=15, fig.width=15}
+FeaturePlot(strict, features = top_spread(strict.markers, 1)$rank1, 
+            reduction = 'umap', cols = c('#e7e1ef',"#b71540"), 
+            coord.fixed = TRUE)
+
+VlnPlot(strict, features = top_spread(strict.markers, 1)$rank1, slot = "counts", log = TRUE, pt.size = 0)
+
+```
+
+
+### Panglao {.unnumbered}
+
+```{r featureplotp, fig.cap=c("Feature plot of the first DE gene (by avg logFC) for each cluster", "Violin plot of the same genes"), fig.height=15, fig.width=15}
+FeaturePlot(panglao, features = top_spread(panglao.markers, 1)$rank1, 
+            reduction = 'umap', cols = c('#e7e1ef',"#b71540"), 
+            coord.fixed = TRUE)
+
+VlnPlot(panglao, features = top_spread(panglao.markers, 1)$rank1, slot = "counts", log = TRUE, pt.size = 0)
+
+```
+
+## Save progress
+
+```{r save}
+
+saveRDS(loose, file = "data/loose.rds")
+saveRDS(loose.markers, file = "data/loose_markers.rds")
+saveRDS(strict, file = "data/strict.rds")
+saveRDS(strict.markers, file = "data/strict_markers.rds")
+saveRDS(panglao, file = "data/panglao.rds")
+saveRDS(panglao.markers, file = "data/panglao_markers.rds")
+
+```
+
+
+## Type assignment
+
+To assign each cluster to its type we'll search on three different database of markers gene and we'll cross information to be as sure as possible of the assigned cell type. [Panglao Gene Search](https://panglaodb.se/search.html), [Dropviz](http://dropviz.org/) [@saunders2018molecular] and [Mousebrain Gene Search](http://www.mousebrain.org/genesearch.html) [@zeisel2018molecular].
+
+We'll use a little function `panglao_searcher()` that helps us copypasting and assign the new type (in this case I saved the data in another file and run this script on the saved data). This chunk won't be evaluated!
+
+```{r panglaosearcher, eval=FALSE}
+
+ol <- 'Oligodendrocytes'
+n <- 'Neurons'
+u <- 'Unknown'
+a <- 'Astrocytes'
+m <- 'Microglia'
+e <- 'Endothelial cells'
+opc <- 'Oligodendrocytes parental cells'
+i <- 'Interneurons'
+p <- 'Polydendrocytes'
+er <- 'Erythroid-like and erythroid precursor cells'
+ep <-  'Ependymal cells'
+msp <- 'Medium spiny neurons'
+ipc <- 'Intermediate progenitor cells'
+int <- 'Interneurons'
+dspn <- 'Direct spiny neurons'
+ispn <- 'Indirect spiny neurons'
+
+loose_df <- top_spread(loose.markers,3)
+loose_df <- panglao_searcher(loose_df, collapse = ',', append = 'cell_type')
+loose_df <- loose_df %>% mutate_all(as.factor) 
+
+saveRDS(loose_df, "data/loose_type.rds")
+
+strict_df <- top_spread(strict.markers,3)
+strict_df <- panglao_searcher(strict_df, collapse = ',', append = 'cell_type')
+strict_df <- strict_df %>% mutate_all(as.factor)
+
+saveRDS(strict_df, "data/strict_type.rds")
+
+panglao_df <- top_spread(panglao.markers,3)
+panglao_df <- panglao_searcher(panglao_df, collapse = ',', append = 'cell_type')
+panglao_df <- panglao_df %>% mutate_all(as.factor)
+
+saveRDS(panglao_df, "data/panglao_type.rds")
+```
+
+We load a dataframe containing the associated cell type for each cluster and associated cell type. We join this dataset with our Seurat object metadata, then, we set the cell type as new identities.
+
+```{r load}
+loose_df <- readRDS("data/loose_type.rds")
+strict_df <- readRDS("data/strict_type.rds")
+panglao_df <- readRDS("data/panglao_type.rds")
+
+l_id <- as.vector(loose_df$cell_type)
+names(l_id) <- levels(loose)
+loose <- RenameIdents(loose, l_id)
+
+loose@meta.data <- loose@meta.data %>%
+  left_join(loose_df, by = c("seurat_clusters" = "cluster"))
+
+s_id <- as.vector(strict_df$cell_type)
+names(s_id) <- levels(strict)
+strict <- RenameIdents(strict, s_id)
+
+strict@meta.data <- strict@meta.data %>%
+  left_join(strict_df, by = c("seurat_clusters" = "cluster"))
+
+p_id <- as.vector(panglao_df$cell_type)
+names(p_id) <- levels(panglao)
+panglao <- RenameIdents(panglao, p_id)
+
+panglao@meta.data <- panglao@meta.data %>%
+  left_join(panglao_df, by = c("seurat_clusters" = "cluster"))
+```
+
+## Results {.tabset .tabset-fade .tabset-pills}
+
+### Loose {.tabset .tabset-fade .tabset-pills .unnumbered}
+
+```{r loosefinal}
+l <- celltype_analysis(loose, 'cell_type')
+```
+
+#### Clust {.unnumbered}
+
+```{r lfinal1, fig.cap="Cells labeled by cell type in reduced dimensions", fig.width=10, fig.height=6}
+l$clust
+```
+
+#### Clust faceted {.unnumbered}
+
+```{r lfinal2, fig.cap="Cells labeled by cell type in reduced dimensions faceted by cell type", fig.width=14, fig.height=7}
+l$clust_facet
+```
+
+### Strict {.tabset .tabset-fade .tabset-pills .unnumbered}
+
+```{r strictfinal}
+s <- celltype_analysis(strict, 'cell_type')
+```
+
+#### Clust {.unnumbered}
+
+```{r sfinal1, fig.cap="Cells labeled by cell type in reduced dimensions", fig.width=10, fig.height=6}
+s$clust
+```
+
+#### Clust faceted {.unnumbered}
+
+```{r sfinal2, fig.cap="Cells labeled by cell type in reduced dimensions faceted by cell type", fig.width=15, fig.height=7}
+s$clust_facet
+```
+
+
+### Panglao {.tabset .tabset-fade .tabset-pills .unnumbered}
+
+```{r panfinal}
+p <- celltype_analysis(panglao, 'cell_type')
+```
+
+#### Clust {.unnumbered}
+
+```{r pfinal1, fig.cap="Cells labeled by cell type in reduced dimensions", fig.width=10, fig.height=6}
+p$clust
+```
+
+#### Clust faceted {.unnumbered}
+
+```{r pfinal2, fig.cap="Cells labeled by cell type in reduced dimensions faceted by cell type", fig.width=15, fig.height=6}
+p$clust_facet
+```
+
+# SI
+
+```{r writexlsx}
+
+loose_mrk <- loose.markers %>% 
+  left_join(loose_df, by = 'cluster') %>% 
+  select(-contains('rank')) %>% 
+  group_by(cluster) %>%  
+  top_n(6, wt=avg_logFC) %>% ungroup()
+
+xlsx::write.xlsx(as.data.frame(loose_mrk), "data/SI_Mutti.xlsx", sheetName = "loose_markers", row.names = FALSE)
+
+loose_n <- loose@meta.data %>% group_by(cell_type, seurat_clusters) %>% tally() %>% ungroup()
+
+xlsx::write.xlsx(as.data.frame(loose_n), "data/SI_Mutti.xlsx", sheetName = "loose_n_by_clust", row.names = FALSE, append = TRUE)
+
+strict_mrk <- strict.markers %>% 
+  left_join(strict_df, by = 'cluster') %>% 
+  select(-contains('rank')) %>% 
+  group_by(cluster) %>%  
+  top_n(6, wt=avg_logFC) %>% ungroup()
+
+xlsx::write.xlsx(as.data.frame(strict_mrk), "data/SI_Mutti.xlsx", sheetName = "strict_markers", row.names = FALSE, append = TRUE)
+
+strict_n <- strict@meta.data %>% group_by(cell_type, seurat_clusters) %>% tally() %>% ungroup()
+
+xlsx::write.xlsx(as.data.frame(strict_n), "data/SI_Mutti.xlsx", sheetName = "strict_n_by_clust", row.names = FALSE, append = TRUE)
+
+panglao_mrk <- panglao.markers %>% 
+  left_join(panglao_df, by = 'cluster') %>% 
+  select(-contains('rank')) %>% 
+  group_by(cluster) %>%  
+  top_n(6, wt=avg_logFC) %>% ungroup()
+
+xlsx::write.xlsx(as.data.frame(panglao_mrk), "data/SI_Mutti.xlsx", sheetName = "panglao_markers", row.names = FALSE, append = TRUE)
+
+panglao_n <- panglao@meta.data %>% group_by(cell_type, seurat_clusters) %>% tally() %>% ungroup()
+
+xlsx::write.xlsx(as.data.frame(panglao_n), "data/SI_Mutti.xlsx", sheetName = "panglao_n_by_clust", row.names = FALSE, append = TRUE)
+```
+
+# Session 
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+# References
